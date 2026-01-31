@@ -28,7 +28,9 @@ function App() {
   useEffect(() => {
     async function init() {
       try {
-        const exercises = await loadExercises('/difficulty_level.csv');
+        const exercises = await loadExercises(
+          import.meta.env.BASE_URL + 'difficulty_level.csv'
+        );
         actions.setExercises(exercises);
       } catch (err) {
         console.error('Failed to load exercises:', err);
