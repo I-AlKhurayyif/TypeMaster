@@ -1,0 +1,1140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Touch Typing 3D Hands + Keyboard (Real-Time)</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #0b0f14;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: #d7dde6;
+    }
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      pointer-events: none;
+    }
+    #panel {
+      pointer-events: auto;
+      padding: 10px 12px;
+      background: rgba(20, 26, 35, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      backdrop-filter: blur(8px);
+      max-width: 860px;
+    }
+    #panel h1 {
+      margin: 0 0 6px 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: 0.2px;
+    }
+    #panel p {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.35;
+      opacity: 0.9;
+    }
+    #controls {
+      pointer-events: auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      background: rgba(20, 26, 35, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      backdrop-filter: blur(8px);
+      user-select: none;
+    }
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      opacity: 0.95;
+      cursor: pointer;
+    }
+    input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      accent-color: #7aa2ff;
+      cursor: pointer;
+    }
+    #lastKey {
+      font-size: 12px;
+      opacity: 0.85;
+      padding-left: 6px;
+      border-left: 1px solid rgba(255,255,255,0.1);
+      margin-left: 2px;
+    }
+    #canvasWrap {
+      width: 100%;
+      height: 100%;
+    }
+    a {
+      color: #9db6ff;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div id="panel">
+      <h1>3D Touch-Typing Visualizer (Real-Time Physical Keyboard Sync)</h1>
+      <p>
+        Type on your physical keyboard. The correct finger animates to press the matching key on the virtual keyboard
+        using standard touch-typing conventions. Supports continuous typing (key hold + multiple keys).
+        Toggle key/finger highlighting from the controls on the right.
+      </p>
+    </div>
+    <div id="controls">
+      <label><input id="optKeyHighlight" type="checkbox" checked />Key highlight</label>
+      <label><input id="optFingerHighlight" type="checkbox" checked />Finger highlight</label>
+      <span id="lastKey">Last key: <span class="mono" id="lastKeyVal">None</span></span>
+    </div>
+  </div>
+
+  <div id="canvasWrap"></div>
+
+  <!-- Three.js via ESM -->
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    // ============================================================
+    // Config / Constants
+    // ============================================================
+    const KEY_PITCH = 19;          // mm (approx) pitch between key centers
+    const KEY_W = 18;              // mm key top size
+    const KEY_H = 18;
+    const KEY_D = 8;
+    const KEY_GAP = KEY_PITCH - KEY_W; // residual gap
+    const UNIT = 0.01;             // 1 mm -> 0.01 world units (so 100mm = 1.0)
+    const KEY_CAP_Y = 0.0;         // base height (keyboard top plane)
+    const KEY_PRESS_DEPTH = 2.3;   // mm
+    const FINGER_PRESS_DEPTH = 10; // mm fingertip travel target (visual)
+    const ANIM_STIFFNESS = 18.0;   // higher = snappier
+    const ANIM_DAMPING = 0.85;     // smoothing factor for critically damp-ish response
+
+    const COLORS = {
+      bg: 0x0b0f14,
+      keyTop: 0x1f2a37,
+      keySide: 0x111923,
+      keyText: 0xcdd6e3,
+      keyActive: 0x7aa2ff,
+      desk: 0x0f1622,
+      skin: 0xd6b29a,
+      skinShadow: 0xb9917b,
+      nail: 0xe6d6cc,
+      fingerActive: 0x9db6ff,
+      accent: 0x7aa2ff
+    };
+
+    // ============================================================
+    // Utility: simple smooth-damp for scalar and Vector3
+    // ============================================================
+    function smoothDampScalar(current, target, velocityRef, dt, stiffness = ANIM_STIFFNESS) {
+      // A stable spring-ish smoothing (semi-implicit)
+      const k = stiffness;
+      const f = 1.0 + 2.0 * dt * k;
+      const oo = 1.0 / (f + dt * dt * k * k);
+      const x = current - target;
+      const temp = (velocityRef.value + dt * k * x);
+      velocityRef.value = (velocityRef.value - dt * k * temp) * oo;
+      const next = target + (x + dt * temp) * oo;
+      return next;
+    }
+
+    function smoothDampVec3(current, target, velocityRef, dt, stiffness = ANIM_STIFFNESS) {
+      current.x = smoothDampScalar(current.x, target.x, velocityRef.x, dt, stiffness);
+      current.y = smoothDampScalar(current.y, target.y, velocityRef.y, dt, stiffness);
+      current.z = smoothDampScalar(current.z, target.z, velocityRef.z, dt, stiffness);
+      return current;
+    }
+
+    function makeVelRef3() {
+      return { x: { value: 0 }, y: { value: 0 }, z: { value: 0 } };
+    }
+
+    // ============================================================
+    // Keyboard Layout (US QWERTY-ish, main block)
+    // - Each key: label, code candidates, width (units of KEY_PITCH)
+    // - We'll place rows with standard stagger offsets
+    // ============================================================
+    const layoutRows = [
+      // Row 0: numbers
+      [
+        { label: "`", codes: ["Backquote"], w: 1 },
+        { label: "1", codes: ["Digit1"], w: 1 },
+        { label: "2", codes: ["Digit2"], w: 1 },
+        { label: "3", codes: ["Digit3"], w: 1 },
+        { label: "4", codes: ["Digit4"], w: 1 },
+        { label: "5", codes: ["Digit5"], w: 1 },
+        { label: "6", codes: ["Digit6"], w: 1 },
+        { label: "7", codes: ["Digit7"], w: 1 },
+        { label: "8", codes: ["Digit8"], w: 1 },
+        { label: "9", codes: ["Digit9"], w: 1 },
+        { label: "0", codes: ["Digit0"], w: 1 },
+        { label: "-", codes: ["Minus"], w: 1 },
+        { label: "=", codes: ["Equal"], w: 1 },
+        { label: "Backspace", codes: ["Backspace"], w: 2 }
+      ],
+      // Row 1: QWERTY
+      [
+        { label: "Tab", codes: ["Tab"], w: 1.5 },
+        { label: "Q", codes: ["KeyQ"], w: 1 },
+        { label: "W", codes: ["KeyW"], w: 1 },
+        { label: "E", codes: ["KeyE"], w: 1 },
+        { label: "R", codes: ["KeyR"], w: 1 },
+        { label: "T", codes: ["KeyT"], w: 1 },
+        { label: "Y", codes: ["KeyY"], w: 1 },
+        { label: "U", codes: ["KeyU"], w: 1 },
+        { label: "I", codes: ["KeyI"], w: 1 },
+        { label: "O", codes: ["KeyO"], w: 1 },
+        { label: "P", codes: ["KeyP"], w: 1 },
+        { label: "[", codes: ["BracketLeft"], w: 1 },
+        { label: "]", codes: ["BracketRight"], w: 1 },
+        { label: "\\", codes: ["Backslash"], w: 1.5 }
+      ],
+      // Row 2: ASDF
+      [
+        { label: "Caps", codes: ["CapsLock"], w: 1.75 },
+        { label: "A", codes: ["KeyA"], w: 1 },
+        { label: "S", codes: ["KeyS"], w: 1 },
+        { label: "D", codes: ["KeyD"], w: 1 },
+        { label: "F", codes: ["KeyF"], w: 1 },
+        { label: "G", codes: ["KeyG"], w: 1 },
+        { label: "H", codes: ["KeyH"], w: 1 },
+        { label: "J", codes: ["KeyJ"], w: 1 },
+        { label: "K", codes: ["KeyK"], w: 1 },
+        { label: "L", codes: ["KeyL"], w: 1 },
+        { label: ";", codes: ["Semicolon"], w: 1 },
+        { label: "'", codes: ["Quote"], w: 1 },
+        { label: "Enter", codes: ["Enter"], w: 2.25 }
+      ],
+      // Row 3: ZXCV
+      [
+        { label: "Shift", codes: ["ShiftLeft"], w: 2.25 },
+        { label: "Z", codes: ["KeyZ"], w: 1 },
+        { label: "X", codes: ["KeyX"], w: 1 },
+        { label: "C", codes: ["KeyC"], w: 1 },
+        { label: "V", codes: ["KeyV"], w: 1 },
+        { label: "B", codes: ["KeyB"], w: 1 },
+        { label: "N", codes: ["KeyN"], w: 1 },
+        { label: "M", codes: ["KeyM"], w: 1 },
+        { label: ",", codes: ["Comma"], w: 1 },
+        { label: ".", codes: ["Period"], w: 1 },
+        { label: "/", codes: ["Slash"], w: 1 },
+        { label: "Shift", codes: ["ShiftRight"], w: 2.75 }
+      ],
+      // Row 4: Spacebar row (simplified)
+      [
+        { label: "Ctrl", codes: ["ControlLeft"], w: 1.25 },
+        { label: "Win", codes: ["MetaLeft"], w: 1.25 },
+        { label: "Alt", codes: ["AltLeft"], w: 1.25 },
+        { label: "Space", codes: ["Space"], w: 6.25 },
+        { label: "Alt", codes: ["AltRight"], w: 1.25 },
+        { label: "Win", codes: ["MetaRight"], w: 1.25 },
+        { label: "Menu", codes: ["ContextMenu"], w: 1.25 },
+        { label: "Ctrl", codes: ["ControlRight"], w: 1.25 }
+      ]
+    ];
+
+    const rowOffsets = [
+      0.0,   // numbers
+      0.0,   // tab row (we already have Tab width)
+      0.0,   // caps row
+      0.0,   // shift row
+      0.0    // space row
+    ];
+
+    // Vertical row spacing in mm (approx)
+    const ROW_PITCH = 19; // mm
+    const KEYBOARD_TILT = -8 * Math.PI / 180;
+
+    // ============================================================
+    // Touch-typing finger mapping (standard)
+    // Returns finger id like: "L_INDEX", "R_PINKY", "L_THUMB", ...
+    // Notes:
+    // - Numbers & symbols generally follow the same column rules, with
+    //   5/6 split across index fingers.
+    // - We include common keys (letters, punctuation, modifiers).
+    // ============================================================
+    const Finger = {
+      L_PINKY: "L_PINKY",
+      L_RING: "L_RING",
+      L_MIDDLE: "L_MIDDLE",
+      L_INDEX: "L_INDEX",
+      L_THUMB: "L_THUMB",
+      R_THUMB: "R_THUMB",
+      R_INDEX: "R_INDEX",
+      R_MIDDLE: "R_MIDDLE",
+      R_RING: "R_RING",
+      R_PINKY: "R_PINKY"
+    };
+
+    // Map by KeyboardEvent.code (preferred, layout independent for letters)
+    // This is a practical standard mapping for US QWERTY main block.
+    const codeToFinger = new Map([
+      // Left hand letters
+      ["KeyQ", Finger.L_PINKY],
+      ["KeyA", Finger.L_PINKY],
+      ["KeyZ", Finger.L_PINKY],
+
+      ["KeyW", Finger.L_RING],
+      ["KeyS", Finger.L_RING],
+      ["KeyX", Finger.L_RING],
+
+      ["KeyE", Finger.L_MIDDLE],
+      ["KeyD", Finger.L_MIDDLE],
+      ["KeyC", Finger.L_MIDDLE],
+
+      ["KeyR", Finger.L_INDEX],
+      ["KeyF", Finger.L_INDEX],
+      ["KeyV", Finger.L_INDEX],
+      ["KeyT", Finger.L_INDEX],
+      ["KeyG", Finger.L_INDEX],
+      ["KeyB", Finger.L_INDEX],
+
+      // Right hand letters
+      ["KeyY", Finger.R_INDEX],
+      ["KeyH", Finger.R_INDEX],
+      ["KeyN", Finger.R_INDEX],
+      ["KeyU", Finger.R_INDEX],
+      ["KeyJ", Finger.R_INDEX],
+      ["KeyM", Finger.R_INDEX],
+
+      ["KeyI", Finger.R_MIDDLE],
+      ["KeyK", Finger.R_MIDDLE],
+      ["Comma", Finger.R_MIDDLE],
+
+      ["KeyO", Finger.R_RING],
+      ["KeyL", Finger.R_RING],
+      ["Period", Finger.R_RING],
+
+      ["KeyP", Finger.R_PINKY],
+      ["Semicolon", Finger.R_PINKY],
+      ["Slash", Finger.R_PINKY],
+      ["BracketLeft", Finger.R_PINKY],
+      ["BracketRight", Finger.R_PINKY],
+      ["Quote", Finger.R_PINKY],
+      ["Backslash", Finger.R_PINKY],
+
+      // Space
+      ["Space", Finger.R_THUMB], // common: either thumb; we pick right thumb by default
+
+      // Modifiers & special keys (typical teaching rules)
+      ["ShiftLeft", Finger.L_PINKY],
+      ["ShiftRight", Finger.R_PINKY],
+      ["CapsLock", Finger.L_PINKY],
+      ["Tab", Finger.L_PINKY],
+      ["Enter", Finger.R_PINKY],
+      ["Backspace", Finger.R_PINKY],
+      ["Backquote", Finger.L_PINKY],
+
+      // Number row (common column mapping; 5 with left index, 6 with right index)
+      ["Digit1", Finger.L_PINKY],
+      ["Digit2", Finger.L_RING],
+      ["Digit3", Finger.L_MIDDLE],
+      ["Digit4", Finger.L_INDEX],
+      ["Digit5", Finger.L_INDEX],
+      ["Digit6", Finger.R_INDEX],
+      ["Digit7", Finger.R_INDEX],
+      ["Digit8", Finger.R_MIDDLE],
+      ["Digit9", Finger.R_RING],
+      ["Digit0", Finger.R_PINKY],
+      ["Minus", Finger.R_PINKY],
+      ["Equal", Finger.R_PINKY],
+
+      // Bottom row modifiers
+      ["ControlLeft", Finger.L_PINKY],
+      ["AltLeft", Finger.L_THUMB],
+      ["MetaLeft", Finger.L_THUMB],
+      ["AltRight", Finger.R_THUMB],
+      ["MetaRight", Finger.R_THUMB],
+      ["ContextMenu", Finger.R_PINKY],
+      ["ControlRight", Finger.R_PINKY],
+    ]);
+
+    // ============================================================
+    // Three.js scene setup
+    // ============================================================
+    const wrap = document.getElementById("canvasWrap");
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(COLORS.bg, 1);
+    wrap.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      45,
+      window.innerWidth / window.innerHeight,
+      0.01,
+      100
+    );
+    camera.position.set(0.0, 3.2, 4.6);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.35, 0);
+    controls.minDistance = 2.8;
+    controls.maxDistance = 8.0;
+    controls.maxPolarAngle = Math.PI * 0.48;
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xaec6ff, 0x0b0f14, 0.75);
+    scene.add(hemi);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 1.15);
+    dir.position.set(3, 6, 2);
+    dir.castShadow = false;
+    scene.add(dir);
+
+    const fill = new THREE.DirectionalLight(0xb7c7ff, 0.35);
+    fill.position.set(-4, 3, 4);
+    scene.add(fill);
+
+    // Desk plane
+    const deskGeo = new THREE.PlaneGeometry(20, 20);
+    const deskMat = new THREE.MeshStandardMaterial({ color: COLORS.desk, roughness: 1.0, metalness: 0.0 });
+    const desk = new THREE.Mesh(deskGeo, deskMat);
+    desk.rotation.x = -Math.PI / 2;
+    desk.position.y = -0.25;
+    scene.add(desk);
+
+    // ============================================================
+    // Build Keyboard
+    // ============================================================
+    const keyboard = new THREE.Group();
+    keyboard.rotation.x = KEYBOARD_TILT;
+    keyboard.position.set(0, 0.0, 0);
+    scene.add(keyboard);
+
+    // Keyboard base
+    const kbBaseGeo = new THREE.BoxGeometry(7.8, 0.25, 2.9);
+    const kbBaseMat = new THREE.MeshStandardMaterial({ color: 0x0f1724, roughness: 0.9, metalness: 0.05 });
+    const kbBase = new THREE.Mesh(kbBaseGeo, kbBaseMat);
+    kbBase.position.set(0, -0.18, 0);
+    keyboard.add(kbBase);
+
+    // Key materials
+    const keyTopMat = new THREE.MeshStandardMaterial({ color: COLORS.keyTop, roughness: 0.65, metalness: 0.05 });
+    const keySideMat = new THREE.MeshStandardMaterial({ color: COLORS.keySide, roughness: 0.8, metalness: 0.05 });
+
+    // Store keys by code -> object
+    const keyByCode = new Map();
+
+    function makeKey(label, wUnits, hUnits = 1) {
+      const wMm = wUnits * KEY_PITCH - KEY_GAP; // keep gap consistent
+      const hMm = hUnits * KEY_PITCH - KEY_GAP;
+
+      const w = wMm * UNIT;
+      const h = (KEY_D * UNIT);
+      const d = hMm * UNIT;
+
+      // body
+      const bodyGeo = new THREE.BoxGeometry(w, h, d);
+      // Use multi-material: top vs sides approximation by using one material
+      // For better look, we add a thin top plate
+      const body = new THREE.Mesh(bodyGeo, keySideMat);
+
+      const topGeo = new THREE.BoxGeometry(w * 0.98, h * 0.28, d * 0.98);
+      const top = new THREE.Mesh(topGeo, keyTopMat);
+      top.position.y = h * 0.34;
+
+      const g = new THREE.Group();
+      g.add(body);
+      g.add(top);
+
+      g.userData = {
+        label,
+        wUnits,
+        pressed: false,
+        pressT: 0,
+        baseY: 0,
+        targetY: 0,
+        velY: { value: 0 },
+        topMesh: top,
+        bodyMesh: body,
+        activeColor: new THREE.Color(COLORS.keyActive),
+        normalColor: new THREE.Color(COLORS.keyTop)
+      };
+
+      return g;
+    }
+
+    // Approx text: we'll use CanvasTexture per label
+    function makeLabelTexture(text) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 256;
+      canvas.height = 256;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      ctx.fillStyle = "rgba(0,0,0,0)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.font = "bold 92px ui-monospace, Menlo, Consolas, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#cdd6e3";
+
+      const t = text.length > 2 ? text.slice(0, 2) : text;
+      ctx.fillText(t, canvas.width / 2, canvas.height / 2 + 6);
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      tex.needsUpdate = true;
+      return tex;
+    }
+
+    function attachKeyLabel(keyGroup) {
+      const label = keyGroup.userData.label;
+      const tex = makeLabelTexture(label === "Backspace" ? "BS" :
+                                   label === "Enter" ? "EN" :
+                                   label === "Shift" ? "SH" :
+                                   label === "Caps" ? "CA" :
+                                   label === "Space" ? "" :
+                                   label);
+      const mat = new THREE.MeshStandardMaterial({
+        map: tex,
+        transparent: true,
+        roughness: 0.7,
+        metalness: 0.0
+      });
+
+      // place slightly above top
+      const bounds = new THREE.Box3().setFromObject(keyGroup);
+      const size = new THREE.Vector3();
+      bounds.getSize(size);
+
+      const planeGeo = new THREE.PlaneGeometry(size.x * 0.9, size.z * 0.9);
+      const plane = new THREE.Mesh(planeGeo, mat);
+      plane.rotation.x = -Math.PI / 2;
+      plane.position.y = (size.y * 0.5) + 0.004;
+      keyGroup.add(plane);
+      keyGroup.userData.labelPlane = plane;
+    }
+
+    // Place keys row by row
+    const startX = -3.65; // keyboard left start in world units (tuned)
+    const startZ = 1.1;   // keyboard top row Z
+    const rowZStep = ROW_PITCH * UNIT;
+
+    let maxRowWidth = 0;
+
+    for (let r = 0; r < layoutRows.length; r++) {
+      const row = layoutRows[r];
+      // compute row width in units
+      let rowUnits = 0;
+      for (const k of row) rowUnits += k.w;
+      maxRowWidth = Math.max(maxRowWidth, rowUnits);
+
+      let xCursorMm = 0;
+      const z = startZ - r * rowZStep;
+
+      // row alignment: keep left aligned but visually centered overall
+      const rowWidthMm = rowUnits * KEY_PITCH;
+      const rowStartX = -(rowWidthMm * UNIT) / 2;
+
+      for (const k of row) {
+        const key = makeKey(k.label, k.w);
+        attachKeyLabel(key);
+
+        const keyCenterMm = xCursorMm + (k.w * KEY_PITCH) / 2;
+        const x = rowStartX + keyCenterMm * UNIT;
+
+        key.position.set(x, KEY_CAP_Y, z);
+        key.userData.baseY = KEY_CAP_Y;
+        key.userData.targetY = KEY_CAP_Y;
+
+        keyboard.add(key);
+
+        // map codes to this key
+        for (const code of k.codes) {
+          keyByCode.set(code, key);
+        }
+
+        xCursorMm += k.w * KEY_PITCH;
+      }
+    }
+
+    // Add a subtle keyboard outline for orientation
+    const outlineGeo = new THREE.BoxGeometry(8.05, 0.03, 3.15);
+    const outlineMat = new THREE.MeshStandardMaterial({ color: 0x1a2433, roughness: 0.9, metalness: 0.0 });
+    const outline = new THREE.Mesh(outlineGeo, outlineMat);
+    outline.position.set(0, -0.055, 0.0);
+    keyboard.add(outline);
+
+    // ============================================================
+    // Hand Model (procedural, articulated fingers)
+    // Each hand has:
+    // - Palm + wrist
+    // - 5 fingers, each with 3 phalanges (prox, mid, dist) and a fingertip marker
+    // We drive animation by moving the fingertip target toward a key center and
+    // bending joints in a simple heuristic (not full IK, but convincing).
+    // ============================================================
+    function makeHand(isLeft) {
+      const hand = new THREE.Group();
+
+      const skinMat = new THREE.MeshStandardMaterial({ color: COLORS.skin, roughness: 0.78, metalness: 0.0 });
+      const shadowMat = new THREE.MeshStandardMaterial({ color: COLORS.skinShadow, roughness: 0.85, metalness: 0.0 });
+
+      // Wrist
+      const wristGeo = new THREE.CylinderGeometry(0.16, 0.19, 0.35, 18);
+      const wrist = new THREE.Mesh(wristGeo, shadowMat);
+      wrist.rotation.z = Math.PI / 2;
+      wrist.position.set(isLeft ? -0.85 : 0.85, 0.52, 0.95);
+      hand.add(wrist);
+
+      // Palm
+      const palmGeo = new THREE.BoxGeometry(0.95, 0.25, 0.75);
+      const palm = new THREE.Mesh(palmGeo, skinMat);
+      palm.position.set(isLeft ? -0.55 : 0.55, 0.65, 0.55);
+      palm.rotation.y = isLeft ? 0.08 : -0.08;
+      hand.add(palm);
+
+      // Slight palm slope
+      palm.rotation.x = -0.18;
+
+      // Finger builder
+      function makeFinger(name, basePos, baseRotY, lengths, radii) {
+        const finger = new THREE.Group();
+        finger.name = name;
+
+        // Base joint anchor
+        const base = new THREE.Group();
+        base.position.copy(basePos);
+        base.rotation.y = baseRotY;
+        palm.add(base);
+
+        const segs = [];
+        let parent = base;
+
+        for (let i = 0; i < 3; i++) {
+          const len = lengths[i];
+          const r0 = radii[i];
+          const r1 = radii[i] * 0.92;
+
+          const geo = new THREE.CylinderGeometry(r1, r0, len, 16);
+          const mesh = new THREE.Mesh(geo, skinMat);
+
+          // Cylinder is centered; place so it extends forward from joint
+          mesh.rotation.z = Math.PI / 2;
+          mesh.position.x = len / 2;
+
+          const joint = new THREE.Group();
+          joint.add(mesh);
+          parent.add(joint);
+
+          // Move next joint to end of current segment
+          const next = new THREE.Group();
+          next.position.x = len;
+          joint.add(next);
+
+          segs.push({ joint, mesh, len });
+          parent = next;
+        }
+
+        // Fingertip marker (for targeting)
+        const tipGeo = new THREE.SphereGeometry(0.04, 14, 14);
+        const tipMat = new THREE.MeshStandardMaterial({ color: COLORS.nail, roughness: 0.6, metalness: 0.0 });
+        const tip = new THREE.Mesh(tipGeo, tipMat);
+        tip.position.set(0.02, 0, 0);
+        parent.add(tip);
+
+        finger.userData = {
+          base,
+          segs,
+          tip,
+          // animation targets
+          active: false,
+          activeColor: new THREE.Color(COLORS.fingerActive),
+          normalColor: new THREE.Color(COLORS.skin),
+          velTip: makeVelRef3(),
+          tipTargetWorld: new THREE.Vector3(),
+          tipRestWorld: new THREE.Vector3(),
+          lastKeyCode: null
+        };
+
+        hand.add(finger);
+        return finger;
+      }
+
+      // Finger anchor positions relative to palm
+      // Palm local axes: x right, y up, z forward (approx after rotations)
+      const side = isLeft ? -1 : 1;
+      const baseZ = 0.25;
+      const y = 0.08;
+
+      const fingers = {
+        PINKY: makeFinger(
+          isLeft ? "L_PINKY" : "R_PINKY",
+          new THREE.Vector3(side * 0.37, y, baseZ + 0.22),
+          isLeft ? 0.28 : -0.28,
+          [0.30, 0.25, 0.20],
+          [0.06, 0.055, 0.05]
+        ),
+        RING: makeFinger(
+          isLeft ? "L_RING" : "R_RING",
+          new THREE.Vector3(side * 0.24, y, baseZ + 0.11),
+          isLeft ? 0.18 : -0.18,
+          [0.36, 0.28, 0.22],
+          [0.067, 0.062, 0.056]
+        ),
+        MIDDLE: makeFinger(
+          isLeft ? "L_MIDDLE" : "R_MIDDLE",
+          new THREE.Vector3(side * 0.09, y, baseZ + 0.06),
+          isLeft ? 0.10 : -0.10,
+          [0.38, 0.30, 0.24],
+          [0.071, 0.066, 0.060]
+        ),
+        INDEX: makeFinger(
+          isLeft ? "L_INDEX" : "R_INDEX",
+          new THREE.Vector3(side * -0.06, y, baseZ + 0.10),
+          isLeft ? -0.02 : 0.02,
+          [0.36, 0.28, 0.22],
+          [0.067, 0.062, 0.056]
+        )
+      };
+
+      // Thumb (more sideways)
+      const thumb = makeFinger(
+        isLeft ? "L_THUMB" : "R_THUMB",
+        new THREE.Vector3(side * -0.28, -0.02, baseZ - 0.10),
+        isLeft ? -0.95 : 0.95,
+        [0.26, 0.20, 0.16],
+        [0.075, 0.070, 0.065]
+      );
+
+      // Rest positions: cache world tip rest later (after placement)
+      hand.userData = {
+        isLeft,
+        palm,
+        wrist,
+        fingers,
+        thumb,
+        allFingers: [
+          fingers.PINKY,
+          fingers.RING,
+          fingers.MIDDLE,
+          fingers.INDEX,
+          thumb
+        ]
+      };
+
+      return hand;
+    }
+
+    const leftHand = makeHand(true);
+    const rightHand = makeHand(false);
+    scene.add(leftHand);
+    scene.add(rightHand);
+
+    // Place hands relative to keyboard
+    // We'll position hands so index fingers hover over F and J.
+    function worldPosOfKey(code) {
+      const key = keyByCode.get(code);
+      if (!key) return null;
+      const v = new THREE.Vector3();
+      key.getWorldPosition(v);
+      return v;
+    }
+
+    // Tune hand global transforms
+    leftHand.position.set(0, 0.0, 0.0);
+    rightHand.position.set(0, 0.0, 0.0);
+
+    // Cache tip rest positions
+    function cacheRestTips(hand) {
+      for (const f of hand.userData.allFingers) {
+        const tip = f.userData.tip;
+        const w = new THREE.Vector3();
+        tip.getWorldPosition(w);
+        f.userData.tipRestWorld.copy(w);
+        f.userData.tipTargetWorld.copy(w);
+      }
+    }
+
+    cacheRestTips(leftHand);
+    cacheRestTips(rightHand);
+
+    // ============================================================
+    // Finger selection by Finger enum -> finger group
+    // ============================================================
+    const fingerById = new Map();
+    for (const f of leftHand.userData.allFingers) fingerById.set(f.name, f);
+    for (const f of rightHand.userData.allFingers) fingerById.set(f.name, f);
+
+    function fingerIdToObj(fid) {
+      return fingerById.get(fid) || null;
+    }
+
+    // ============================================================
+    // Press logic: target finger tip toward key center and bend joints
+    // - We do not implement full IK; instead we:
+    //   1) compute desired tip world target near key top, slightly down
+    //   2) smoothly move a "virtual tip target" (not the mesh) and
+    //   3) infer joint rotations based on distance + direction
+    // This yields a realistic press motion for training visualization.
+    // ============================================================
+    function setKeyPressed(keyObj, pressed) {
+      if (!keyObj) return;
+      keyObj.userData.pressed = pressed;
+      keyObj.userData.targetY = keyObj.userData.baseY + (pressed ? -(KEY_PRESS_DEPTH * UNIT) : 0);
+    }
+
+    function highlightKey(keyObj, on) {
+      if (!keyObj) return;
+      const top = keyObj.userData.topMesh;
+      if (!top) return;
+      const doHighlight = document.getElementById("optKeyHighlight").checked;
+      const col = (on && doHighlight) ? keyObj.userData.activeColor : keyObj.userData.normalColor;
+      top.material.color.copy(col);
+    }
+
+    function highlightFinger(fingerObj, on) {
+      if (!fingerObj) return;
+      const doHighlight = document.getElementById("optFingerHighlight").checked;
+
+      // Color the segment meshes
+      const col = (on && doHighlight) ? fingerObj.userData.activeColor : fingerObj.userData.normalColor;
+
+      for (const s of fingerObj.userData.segs) {
+        s.mesh.material.color.copy(col);
+      }
+    }
+
+    function getFingerForCode(code) {
+      return codeToFinger.get(code) || null;
+    }
+
+    function getKeyForCode(code) {
+      return keyByCode.get(code) || null;
+    }
+
+    function setFingerPressTarget(fingerObj, keyObj, pressed) {
+      if (!fingerObj) return;
+
+      if (!keyObj) {
+        // Unknown key: return to rest
+        fingerObj.userData.active = false;
+        fingerObj.userData.lastKeyCode = null;
+        fingerObj.userData.tipTargetWorld.copy(fingerObj.userData.tipRestWorld);
+        highlightFinger(fingerObj, false);
+        return;
+      }
+
+      const keyPos = new THREE.Vector3();
+      keyObj.getWorldPosition(keyPos);
+
+      // Aim slightly above key then down when pressed
+      // key top plane: y around keyboard tilt; use world pos + offset
+      const target = keyPos.clone();
+      target.y += 0.18; // hover height
+      target.z += 0.01; // tiny forward bias
+
+      if (pressed) {
+        target.y -= (FINGER_PRESS_DEPTH * UNIT);
+      }
+
+      fingerObj.userData.active = pressed;
+      fingerObj.userData.lastKeyCode = pressed ? keyObj.userData.label : null;
+      fingerObj.userData.tipTargetWorld.copy(target);
+
+      highlightFinger(fingerObj, pressed);
+    }
+
+    function updateFingerKinematics(fingerObj) {
+      // Heuristic joint bending: based on how far tip target is from rest
+      // and direction downward; keeps finger mostly forward with curl
+      const tip = fingerObj.userData.tip;
+      const segs = fingerObj.userData.segs;
+
+      const tipWorld = new THREE.Vector3();
+      tip.getWorldPosition(tipWorld);
+
+      const toTarget = fingerObj.userData.tipTargetWorld.clone().sub(tipWorld);
+
+      // Convert target vector to the base joint local space for stable rotations
+      const base = fingerObj.userData.base;
+      const baseWorldPos = new THREE.Vector3();
+      base.getWorldPosition(baseWorldPos);
+
+      const baseWorldQuat = new THREE.Quaternion();
+      base.getWorldQuaternion(baseWorldQuat);
+
+      const invBaseQuat = baseWorldQuat.clone().invert();
+      const localVec = toTarget.clone().applyQuaternion(invBaseQuat);
+
+      // localVec.x ~ forward, localVec.y ~ up, localVec.z ~ sideways
+      // We curl mostly around Z (since segments extend along +X and are rotated)
+      // and add slight yaw around Y to reach left/right.
+      const reach = localVec.length();
+
+      // Desired curl based on downward component and distance
+      const down = Math.max(0, -localVec.y); // how much we need to go down
+      const curlBase = THREE.MathUtils.clamp((down * 6.0) + (reach * 0.8), 0, 1.25);
+
+      // Distribute curl across joints (prox > mid > dist)
+      const curl1 = curlBase * 0.60;
+      const curl2 = curlBase * 0.42;
+      const curl3 = curlBase * 0.28;
+
+      // Side yaw: small rotation around Y at base joint
+      const yaw = THREE.MathUtils.clamp(localVec.z * 2.0, -0.35, 0.35);
+
+      // Apply rotations smoothly (store per joint velocity)
+      // We'll keep per joint "target rotations" in userData
+      if (!fingerObj.userData.jointState) {
+        fingerObj.userData.jointState = segs.map(() => ({
+          rx: 0, ry: 0, rz: 0,
+          vx: { value: 0 }, vy: { value: 0 }, vz: { value: 0 }
+        }));
+      }
+
+      // Base yaw applied on segment 0 joint (its group)
+      const targets = [
+        { ry: yaw, rz: -curl1 },
+        { ry: 0.0, rz: -curl2 },
+        { ry: 0.0, rz: -curl3 }
+      ];
+
+      for (let i = 0; i < segs.length; i++) {
+        const st = fingerObj.userData.jointState[i];
+        const t = targets[i];
+
+        st.ry = smoothDampScalar(st.ry, t.ry, st.vy, deltaTime, 20.0);
+        st.rz = smoothDampScalar(st.rz, t.rz, st.vz, deltaTime, 20.0);
+
+        segs[i].joint.rotation.y = st.ry;
+        segs[i].joint.rotation.z = st.rz;
+      }
+    }
+
+    // ============================================================
+    // Input handling: keydown/keyup with continuous support
+    // ============================================================
+    const pressedCodes = new Set();
+
+    const lastKeyValEl = document.getElementById("lastKeyVal");
+
+    function updateLastKeyDisplay(code) {
+      lastKeyValEl.textContent = code || "None";
+    }
+
+    function handleKeyDown(e) {
+      // Avoid repeating same code due to key repeat; still allow continuous press
+      // for held keys: keep pressedCodes as set
+      const code = e.code;
+      if (!code) return;
+
+      pressedCodes.add(code);
+      updateLastKeyDisplay(code);
+
+      const keyObj = getKeyForCode(code);
+      const fingerId = getFingerForCode(code);
+
+      // Visual key press
+      if (keyObj) {
+        setKeyPressed(keyObj, true);
+        highlightKey(keyObj, true);
+      }
+
+      // Finger animation
+      if (fingerId) {
+        const fingerObj = fingerIdToObj(fingerId);
+        setFingerPressTarget(fingerObj, keyObj, true);
+      }
+    }
+
+    function handleKeyUp(e) {
+      const code = e.code;
+      if (!code) return;
+
+      pressedCodes.delete(code);
+
+      const keyObj = getKeyForCode(code);
+      const fingerId = getFingerForCode(code);
+
+      if (keyObj) {
+        setKeyPressed(keyObj, false);
+        highlightKey(keyObj, false);
+      }
+
+      if (fingerId) {
+        const fingerObj = fingerIdToObj(fingerId);
+        // Return to rest (not necessarily rest if another key uses same finger and is still pressed)
+        // If any other pressed code maps to same finger, keep it active toward that key.
+        let keepCode = null;
+        for (const c of pressedCodes) {
+          if (getFingerForCode(c) === fingerId) {
+            keepCode = c;
+            break;
+          }
+        }
+        if (keepCode) {
+          const keepKey = getKeyForCode(keepCode);
+          setFingerPressTarget(fingerObj, keepKey, true);
+        } else {
+          setFingerPressTarget(fingerObj, null, false);
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+
+    // ============================================================
+    // Animation update: keys and fingers
+    // ============================================================
+    let lastT = performance.now();
+    let deltaTime = 1 / 60;
+
+    function updateKeys(dt) {
+      for (const [code, keyObj] of keyByCode.entries()) {
+        if (!keyObj) continue;
+        // only animate each unique key once (codes may overlap labels, but in our map they are unique)
+        // smooth y position
+        keyObj.position.y = smoothDampScalar(
+          keyObj.position.y,
+          keyObj.userData.targetY,
+          keyObj.userData.velY,
+          dt,
+          26.0
+        );
+      }
+    }
+
+    function updateFingers(dt) {
+      // Smoothly move each finger's target by moving a conceptual tip target;
+      // then rotate joints to chase it (heuristic curl).
+      for (const [fid, fingerObj] of fingerById.entries()) {
+        if (!fingerObj) continue;
+
+        // If finger is not active and no key held for it, glide back to rest
+        if (!fingerObj.userData.active) {
+          fingerObj.userData.tipTargetWorld.lerp(fingerObj.userData.tipRestWorld, 1 - Math.pow(ANIM_DAMPING, dt * 60));
+          highlightFinger(fingerObj, false);
+        }
+
+        // We cannot directly set the tip in world space without IK.
+        // Instead, we bend joints based on "distance to target" (computed from current tip pos).
+        updateFingerKinematics(fingerObj);
+      }
+    }
+
+    // ============================================================
+    // Improve learning perspective: subtle camera framing helper
+    // ============================================================
+    function enforceLearningCamera() {
+      // Keep a helpful default if user hasn't interacted much
+      // (OrbitControls handles manual adjustments.)
+      // No forced camera beyond OrbitControls constraints.
+    }
+
+    // ============================================================
+    // Resize
+    // ============================================================
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ============================================================
+    // Main loop
+    // ============================================================
+    function animate() {
+      const now = performance.now();
+      deltaTime = Math.min(0.033, (now - lastT) / 1000);
+      lastT = now;
+
+      controls.update();
+
+      updateKeys(deltaTime);
+      updateFingers(deltaTime);
+      enforceLearningCamera();
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    // ============================================================
+    // Initial positioning: align hands over home row
+    // ============================================================
+    function nudgeHandsToHomeRow() {
+      const fKey = worldPosOfKey("KeyF");
+      const jKey = worldPosOfKey("KeyJ");
+      if (!fKey || !jKey) return;
+
+      // Put left index fingertip near F, right index near J
+      const lIndex = fingerIdToObj(Finger.L_INDEX);
+      const rIndex = fingerIdToObj(Finger.R_INDEX);
+
+      if (lIndex) {
+        lIndex.userData.tipTargetWorld.copy(fKey).add(new THREE.Vector3(0, 0.18, 0));
+        lIndex.userData.tipRestWorld.copy(lIndex.userData.tipTargetWorld);
+      }
+      if (rIndex) {
+        rIndex.userData.tipTargetWorld.copy(jKey).add(new THREE.Vector3(0, 0.18, 0));
+        rIndex.userData.tipRestWorld.copy(rIndex.userData.tipTargetWorld);
+      }
+
+      // Place the whole hand groups so palms look natural above keys
+      // (Tuned offsets for this scene.)
+      leftHand.position.set(-0.35, 0.05, 0.10);
+      rightHand.position.set(0.35, 0.05, 0.10);
+
+      leftHand.rotation.y = 0.10;
+      rightHand.rotation.y = -0.10;
+
+      // Re-cache rest tips after moving hands
+      cacheRestTips(leftHand);
+      cacheRestTips(rightHand);
+    }
+
+    nudgeHandsToHomeRow();
+    animate();
+
+    // ============================================================
+    // Quality-of-life: handle losing focus (release stuck keys)
+    // ============================================================
+    window.addEventListener("blur", () => {
+      for (const c of Array.from(pressedCodes)) {
+        pressedCodes.delete(c);
+        const k = getKeyForCode(c);
+        if (k) {
+          setKeyPressed(k, false);
+          highlightKey(k, false);
+        }
+        const fid = getFingerForCode(c);
+        if (fid) {
+          const f = fingerIdToObj(fid);
+          setFingerPressTarget(f, null, false);
+        }
+      }
+      updateLastKeyDisplay("None");
+    });
+
+  </script>
+</body>
+</html>
